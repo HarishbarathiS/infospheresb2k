@@ -65,6 +65,8 @@ export async function POST(request: NextRequest) {
       selectedFiles = JSON.parse(selectedFilesStr);
     }
 
+    const referenceFile = formData ? (formData.get('reference_file') as File) : null;
+
     if (!projectData || !fileGroups || !selectedFiles) {
       return NextResponse.json(
         { error: 'Project data, file groups, and selected files are required' },
@@ -95,18 +97,42 @@ export async function POST(request: NextRequest) {
 
     const projectId = projectResult.project_id;
 
+    // 1.5. Handle reference file upload if exists
+    if (referenceFile) {
+      const safeReferenceName = generateSafeStorageFileName(referenceFile.name);
+      const referencePath = `${projectId}/${safeReferenceName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("project-references")
+        .upload(referencePath, referenceFile, {
+          contentType: referenceFile.type || 'application/octet-stream',
+          upsert: false
+        });
+
+      if (!uploadError) {
+        // Update project with the actual reference file path
+        await supabase
+          .from("projects_test")
+          .update({ reference_file: referenceFile.name + "|" + referencePath })
+          .eq("project_id", projectId);
+      } else {
+        console.error('Reference file upload error:', uploadError);
+        // We continue even if reference file fails, but maybe log it
+      }
+    }
+
     // 2. Create tasks and files for each group
     for (let groupIndex = 0; groupIndex < fileGroups.length; groupIndex++) {
       const group = fileGroups[groupIndex];
 
       // Create task - normalize task_type (empty string to null) and remove processor_type if it doesn't exist in table
       const { processor_type: _processor_type, ...taskDataWithoutProcessorType } = group.taskData;
-      
+
       // Ensure task_name is set - use project_name-{index} if empty
       const taskName = group.taskData.task_name && group.taskData.task_name.trim() !== ''
         ? group.taskData.task_name
         : `${projectData.project_name}-${groupIndex + 1}`;
-      
+
       // Fallback to project-level values if task-level values are empty
       const taskType = group.taskData.task_type && group.taskData.task_type.trim() !== ''
         ? group.taskData.task_type
@@ -123,7 +149,7 @@ export async function POST(request: NextRequest) {
       const clientInstruction = group.taskData.client_instruction && group.taskData.client_instruction.trim() !== ''
         ? group.taskData.client_instruction
         : (projectData.client_instructions || null);
-      
+
       const taskDataToInsert = {
         ...taskDataWithoutProcessorType,
         project_id: projectId,

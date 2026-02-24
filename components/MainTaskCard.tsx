@@ -1,4 +1,4 @@
-import { Calendar, Clock, ChevronDown, Edit2, Loader2 } from "lucide-react";
+import { Calendar, Clock, ChevronDown, Edit2, Loader2, Download } from "lucide-react";
 import React from "react";
 import { getPriorityBadge } from "./task/priority";
 import { getStatusBadge } from "./task/status";
@@ -263,6 +263,31 @@ export const MainTaskCard = ({
       return `${displayHour}:${minutes} ${ampm}`;
     } catch {
       return timeString;
+    }
+  };
+
+  const handleDownloadReference = async (fileName: string, storagePath: string) => {
+    try {
+      const { data, error } = await supabase.storage
+        .from("project-references")
+        .download(storagePath);
+
+      if (error) throw error;
+      if (!data) throw new Error("No file data found");
+
+      const url = URL.createObjectURL(data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      toast.success("Reference file downloaded");
+    } catch (error) {
+      console.error("Error downloading reference file:", error);
+      toast.error("Failed to download reference file");
     }
   };
 
@@ -580,7 +605,22 @@ export const MainTaskCard = ({
                 <h3 className="text-sm font-medium text-gray-500 mb-1">
                   Reference File
                 </h3>
-                <p className="text-gray-900">{task.reference_file}</p>
+                {task.reference_file.includes('|') ? (
+                  (() => {
+                    const [fileName, storagePath] = task.reference_file.split('|');
+                    return (
+                      <button
+                        onClick={() => handleDownloadReference(fileName, storagePath)}
+                        className="flex items-center gap-2 text-blue-600 hover:text-blue-800 font-medium transition-colors"
+                      >
+                        <Download className="h-4 w-4" />
+                        <span className="truncate max-w-[200px]">{fileName}</span>
+                      </button>
+                    );
+                  })()
+                ) : (
+                  <p className="text-gray-900">{task.reference_file}</p>
+                )}
               </div>
             )}
 
