@@ -43,12 +43,25 @@ export async function POST(request: NextRequest) {
             }
         });
 
-        // 2. Fetch all task actions for these tasks (assigned_to and taken_by)
+        // 2. Fetch current stage from task_iterations
+        const { data: iterationsData, error: iterationsError } = await supabase
+            .from('task_iterations')
+            .select('task_id, current_stage')
+            .in('task_id', taskIds);
+
+        if (iterationsError) {
+            console.error('Error fetching current stages:', iterationsError);
+        }
+
+        const stageMap = new Map<string, string>();
+        iterationsData?.forEach(i => stageMap.set(i.task_id, i.current_stage || 'Processor'));
+
+        // 3. Fetch all relevant task actions (assigned_to, taken_by, handover, AND send_to)
         const { data: actions, error: actionsError } = await supabase
             .from('task_actions')
             .select('*')
             .in('task_id', taskIds)
-            .in('action_type', ['assigned_to', 'taken_by'])
+            .in('action_type', ['assigned_to', 'taken_by', 'handover', 'send_to'])
             .order('created_at', { ascending: false });
 
         if (actionsError) {
@@ -56,9 +69,11 @@ export async function POST(request: NextRequest) {
             throw actionsError;
         }
 
-        // 3. Collect all unique user IDs that need profile resolution
+        // 4. Collect all unique user IDs that need profile resolution
         const userIds = new Set<string>();
         actions?.forEach(action => {
+            if (action.action_type === 'handover' || action.action_type === 'send_to') return;
+
             const isAssignedTo = action.action_type === 'assigned_to';
             const userId = isAssignedTo
                 ? (action.metadata?.assigned_to_user_id || action.user_id)
@@ -66,7 +81,7 @@ export async function POST(request: NextRequest) {
             if (userId) userIds.add(userId);
         });
 
-        // 4. Fetch user profiles for name/email/role resolution
+        // 5. Fetch user profiles for name/email/role resolution
         const { data: profiles, error: profilesError } = await supabase
             .from('profiles')
             .select('id, name, email, role')
@@ -79,13 +94,8 @@ export async function POST(request: NextRequest) {
         const profilesMap = new Map();
         profiles?.forEach(p => profilesMap.set(p.id, p));
 
-        // 5. Group actions by task and process
+        // 6. Group and process actions by task
         const results: Record<string, any[]> = {};
-
-        // Initialize empty arrays for all tasks
-        taskIds.forEach(taskId => {
-            results[taskId] = [];
-        });
 
         // Group actions by task_id
         const taskActionsMap = new Map<string, any[]>();
@@ -100,34 +110,58 @@ export async function POST(request: NextRequest) {
         taskIds.forEach(taskId => {
             const taskActions = taskActionsMap.get(taskId) || [];
             const creatorId = creatorsMap.get(taskId);
+            const currentStage = stageMap.get(taskId) || 'Processor';
 
-            // Convert actions to user objects
-            const users = taskActions.map(action => {
-                const isAssignedTo = action.action_type === 'assigned_to';
-                const userId = isAssignedTo
-                    ? (action.metadata?.assigned_to_user_id || action.user_id)
-                    : action.user_id;
+            // Find the latest transition timestamp (handover or send_to)
+            const latestTransitionAction = taskActions.find(a =>
+                a.action_type === 'handover' || a.action_type === 'send_to'
+            );
+            const latestTransitionTime = latestTransitionAction ? new Date(latestTransitionAction.created_at) : new Date(0);
 
-                const profile = profilesMap.get(userId);
+            // Convert and filter actions to user objects
+            const users = taskActions
+                .filter(action => action.action_type === 'assigned_to' || action.action_type === 'taken_by')
+                .map(action => {
+                    const isAssignedTo = action.action_type === 'assigned_to';
+                    const userId = isAssignedTo
+                        ? (action.metadata?.assigned_to_user_id || action.user_id)
+                        : action.user_id;
 
-                // Prefer profile data, fall back to metadata, then user_id
-                return {
-                    user_id: userId,
-                    name: profile?.name || action.metadata?.assigned_to_user_name || action.metadata?.user_name || userId,
-                    email: profile?.email || action.metadata?.assigned_to_user_email || action.metadata?.user_email || '',
-                    role: profile?.role || action.metadata?.assigned_to_user_role || action.metadata?.user_role || '',
-                    action_type: action.action_type,
-                    assigned_at: action.created_at
-                };
+                    const profile = profilesMap.get(userId);
+
+                    // Get the stage this assignment happened for
+                    const assignmentStage = isAssignedTo
+                        ? (action.metadata?.assignment_stage || '')
+                        : (action.metadata?.stage || '');
+
+                    return {
+                        user_id: userId,
+                        name: profile?.name || action.metadata?.assigned_to_user_name || action.metadata?.user_name || userId,
+                        email: profile?.email || action.metadata?.assigned_to_user_email || action.metadata?.user_email || '',
+                        role: profile?.role || action.metadata?.assigned_to_user_role || action.metadata?.user_role || '',
+                        action_type: action.action_type,
+                        assigned_at: action.created_at,
+                        stage: assignmentStage
+                    };
+                });
+
+            // Filter by:
+            // 1. Not the task creator
+            // 2. Matches the current task stage
+            // 3. Happened AFTER the latest transition (handover or send_to)
+            const filtered = users.filter(u => {
+                const isNotCreator = u.user_id !== creatorId;
+                const matchesStage = !u.stage || u.stage.toLowerCase() === currentStage.toLowerCase();
+                const afterTransition = new Date(u.assigned_at) > latestTransitionTime;
+
+                return isNotCreator && matchesStage && afterTransition;
             });
 
-            // Filter out the task creator
-            const filtered = users.filter(u => u.user_id !== creatorId);
-
-            // Keep only the most recent assignment (actions are already ordered by created_at desc)
+            // Keep only the most recent assignment
             if (filtered.length > 0) {
-                // The first one is the most recent since we ordered by created_at desc
                 results[taskId] = [filtered[0]];
+            } else {
+                results[taskId] = [];
             }
         });
 

@@ -2261,6 +2261,7 @@ export default function TaskDetailPage() {
           assignmentRefreshTrigger={assignmentRefreshTrigger}
           setShowHandoverDialog={setShowHandoverDialog}
           hideActionButtons={true}
+          isAssigning={_isAssigning}
         />
       </div>
 
@@ -2357,6 +2358,7 @@ export default function TaskDetailPage() {
                   assignmentRefreshTrigger={assignmentRefreshTrigger}
                   setShowHandoverDialog={setShowHandoverDialog}
                   showOnlyActionButtons={true}
+                  isAssigning={_isAssigning}
                 />
               }
               isSubmitting={submittingFiles}

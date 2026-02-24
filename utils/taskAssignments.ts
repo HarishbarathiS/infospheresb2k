@@ -67,7 +67,7 @@ export async function fetchTaskAssignments(
         if (actionsResult.success && actionsResult.data) {
             // Process task actions to get assigned users
             taskActionsUsers = actionsResult.data
-                .filter((action: any) => action.user_id !== taskCreatorId) // Filter out creator
+                .filter((action: any) => action.user_id !== taskCreatorId && action.action_type !== "handover") // Filter out creator and handovers
                 .map(
                     (action: {
                         user_id: string;
@@ -85,41 +85,39 @@ export async function fetchTaskAssignments(
                             assigned_to_user_role?: string;
                         };
                     }) => {
-                        // For 'assigned_to' actions, use the assigned_to_user_* fields from metadata
-                        // which represent the person BEING assigned, not the person doing the assigning
                         const isAssignedToAction = action.action_type === "assigned_to";
                         const actualUserId = isAssignedToAction
                             ? (action.metadata?.assigned_to_user_id || action.user_id)
                             : action.user_id;
-                        const actualUserName = isAssignedToAction
-                            ? (action.metadata?.assigned_to_user_name || action.metadata?.user_name || action.user_id)
-                            : (action.metadata?.user_name || action.user_id);
-                        const actualUserEmail = isAssignedToAction
-                            ? (action.metadata?.assigned_to_user_email || action.metadata?.user_email || "")
-                            : (action.metadata?.user_email || "");
-                        const actualUserRole = isAssignedToAction
-                            ? (action.metadata?.assigned_to_user_role || action.metadata?.user_role || "")
-                            : (action.metadata?.user_role || "");
+
+                        // Extract stage from metadata
+                        const assignmentStage = isAssignedToAction
+                            ? (action.metadata?.assignment_stage || "")
+                            : (action.metadata?.stage || "");
 
                         return {
                             user_id: actualUserId,
-                            name: actualUserName,
-                            email: actualUserEmail,
-                            role: actualUserRole,
+                            name: isAssignedToAction
+                                ? (action.metadata?.assigned_to_user_name || action.metadata?.user_name || action.user_id)
+                                : (action.metadata?.user_name || action.user_id),
+                            email: isAssignedToAction
+                                ? (action.metadata?.assigned_to_user_email || action.metadata?.user_email || "")
+                                : (action.metadata?.user_email || ""),
+                            role: isAssignedToAction
+                                ? (action.metadata?.assigned_to_user_role || action.metadata?.user_role || "")
+                                : (action.metadata?.user_role || ""),
                             action_type: action.action_type,
                             assigned_at: action.created_at,
-                            stage: action.action_type === "assigned_to"
-                                ? (action.metadata?.assignment_stage || "")
-                                : (action.metadata?.stage || ""),
+                            stage: assignmentStage,
                             source: "task_actions",
                         };
                     }
                 );
 
-            // Filter by current stage if available
+            // Filter by current stage if available (case-insensitive)
             if (currentStage) {
                 taskActionsUsers = taskActionsUsers.filter(
-                    (user) => user.stage === currentStage
+                    (user) => !user.stage || user.stage.toLowerCase() === currentStage.toLowerCase()
                 );
             }
         }
@@ -158,6 +156,8 @@ export async function fetchTaskAssignments(
                 }) => {
                     // Process taken_by field
                     if (file.taken_by && file.taken_by !== taskCreatorId) {
+                        // For taken_by in files table, we usually don't have stage info,
+                        // but if we are in a stage where people take files, it applies.
                         filesUsers.push({
                             user_id: file.taken_by,
                             name: file.taken_by,
@@ -165,7 +165,7 @@ export async function fetchTaskAssignments(
                             role: "",
                             action_type: "taken_by",
                             assigned_at: file.created_at,
-                            stage: "", // Files table usually doesn't have stage info
+                            stage: "",
                             source: "files_test",
                         });
                     }
@@ -187,8 +187,7 @@ export async function fetchTaskAssignments(
                                     // Skip the creator
                                     if (userId === taskCreatorId) return;
 
-                                    // Filter by current stage if possible (match role to stage)
-                                    // e.g. currentStage "QC" matches role "QC"
+                                    // Filter by current stage (match role to stage, case-insensitive)
                                     if (currentStage && assignment.role &&
                                         assignment.role.toLowerCase() !== currentStage.toLowerCase()) {
                                         return;
@@ -219,139 +218,85 @@ export async function fetchTaskAssignments(
         // Combine both sources
         let allUsers = [...taskActionsUsers, ...filesUsers];
 
-        console.log(`🔍 Before handover check: ${allUsers.length} total users (${taskActionsUsers.length} from actions, ${filesUsers.length} from files)`);
-
-        // Check if there's a handover action after the last assignment (check AFTER combining sources)
-        const handoverResult = await getTaskActions({
+        // Fetch transitions (handover and send_to) to check for reset points
+        const transitionsResult = await getTaskActions({
             task_id: taskId,
-            action_type: "handover",
+            action_type: ["handover", "send_to"],
         });
 
-        if (handoverResult.success && handoverResult.data && handoverResult.data.length > 0) {
-            // Get the latest handover timestamp
-            const latestHandover = handoverResult.data[0]; // Already sorted by created_at desc
-            const handoverTime = new Date(latestHandover.created_at);
-
-            // Get the latest assignment timestamp from ALL sources
-            const latestAssignmentTime = allUsers.length > 0
-                ? new Date(Math.max(...allUsers.map(u => new Date(u.assigned_at).getTime())))
-                : new Date(0);
-
-            console.log('🔍 Handover check (combined):', {
-                handoverTime: handoverTime.toISOString(),
-                latestAssignmentTime: latestAssignmentTime.toISOString(),
-                willClear: handoverTime > latestAssignmentTime,
-                currentAssignments: allUsers.length
-            });
-
-            // If handover happened after the last assignment, clear ALL assignments
-            if (handoverTime > latestAssignmentTime) {
-                allUsers = [];
-                console.log('✅ Cleared ALL assignments due to handover');
-            } else {
-                // If there was a handover but new assignments after it,
-                // keep only assignments that happened AFTER the handover
-                allUsers = allUsers.filter(u => new Date(u.assigned_at) > handoverTime);
-                console.log(`✅ Filtered to ${allUsers.length} assignments after handover`);
-            }
+        let latestTransitionTime = new Date(0);
+        if (transitionsResult.success && transitionsResult.data && transitionsResult.data.length > 0) {
+            // Data is sorted by created_at desc by getTaskActions usually
+            const latestTransition = transitionsResult.data[0];
+            latestTransitionTime = new Date(latestTransition.created_at);
         }
+
+        // Filter to only keep assignments that happened AFTER the latest transition
+        allUsers = allUsers.filter(u => new Date(u.assigned_at) > latestTransitionTime);
 
         // Remove duplicates based on user_id and keep the latest action
         const uniqueAssignedUsers = allUsers.reduce(
-            (
-                acc: {
-                    user_id: string;
-                    name: string;
-                    email: string;
-                    role: string;
-                    action_type: string;
-                    assigned_at: string;
-                    stage: string;
-                    source: string;
-                }[],
-                current: {
-                    user_id: string;
-                    name: string;
-                    email: string;
-                    role: string;
-                    action_type: string;
-                    assigned_at: string;
-                    stage: string;
-                    source: string;
-                }
-            ) => {
+            (acc: any[], current: any) => {
                 const existingIndex = acc.findIndex(
                     (user) => user.user_id === current.user_id
                 );
                 if (existingIndex === -1) {
                     acc.push(current);
-                } else {
-                    // Keep the latest assignment
-                    if (
-                        new Date(current.assigned_at) >
-                        new Date(acc[existingIndex].assigned_at)
-                    ) {
-                        acc[existingIndex] = current;
-                    }
+                } else if (new Date(current.assigned_at) > new Date(acc[existingIndex].assigned_at)) {
+                    acc[existingIndex] = current;
                 }
                 return acc;
             },
             []
         );
 
-        // Resolve user names for user_ids that don't have names
+        // Resolve names from profiles if missing
         const usersWithResolvedNames = await Promise.all(
             uniqueAssignedUsers.map(async (user) => {
                 if (!user.name || user.name === user.user_id) {
-                    try {
-                        const { data: profileData, error: profileError } = await supabase
-                            .from("profiles")
-                            .select("name, email, role")
-                            .eq("id", user.user_id)
-                            .single();
+                    const { data: profile } = await supabase
+                        .from("profiles")
+                        .select("name, email, role")
+                        .eq("id", user.user_id)
+                        .single();
 
-                        if (!profileError && profileData) {
-                            return {
-                                ...user,
-                                name: profileData.name || user.name,
-                                email: profileData.email || user.email,
-                                role: profileData.role || user.role,
-                            };
-                        }
-                    } catch (error) {
-                        console.warn(
-                            `Failed to fetch profile for user ${user.user_id}:`,
-                            error
-                        );
+                    if (profile) {
+                        return {
+                            ...user,
+                            name: profile.name || user.name,
+                            email: profile.email || user.email,
+                            role: profile.role || user.role,
+                        };
                     }
                 }
                 return user;
             })
         );
 
-        // Filter out the task creator from assigned users (redundant but safe)
-        let finalFilteredUsers = usersWithResolvedNames.filter(
+        // Final filter to ensure we don't have the creator or current user if passed
+        let finalUsers = usersWithResolvedNames.filter(
             (user) => user.user_id !== taskCreatorId && user.user_id !== creatorId
         );
 
-        // Keep only the most recent assignment (latest person working on the task)
-        if (finalFilteredUsers.length > 1) {
-            const mostRecent = finalFilteredUsers.reduce((latest, current) => {
-                return new Date(current.assigned_at) > new Date(latest.assigned_at) ? current : latest;
-            });
-            finalFilteredUsers = [mostRecent];
+        // Sort by assigned_at desc
+        finalUsers.sort((a, b) => new Date(b.assigned_at).getTime() - new Date(a.assigned_at).getTime());
+
+        // For the task page, we might want to see the active set. 
+        // If there's multiple, they should all be in the current stage.
+        // However, the user said "working on column fine... inside assigned to section... not updated properly".
+        // Usually, only one person is "actively" working in a stage. 
+        // To be safe and consistent with dashboard, let's keep only the latest one.
+        if (finalUsers.length > 1) {
+            finalUsers = [finalUsers[0]];
         }
 
-        // Return simplified format
-        const result = finalFilteredUsers.map((user) => ({
+        return finalUsers.map((user) => ({
             user_id: user.user_id,
             name: user.name,
             email: user.email,
             role: user.role,
             action_type: user.action_type,
         }));
-
-        return result;
     } catch (error) {
         console.error("Error fetching task assignments:", error);
         return [];

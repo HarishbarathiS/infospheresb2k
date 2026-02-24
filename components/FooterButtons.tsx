@@ -43,6 +43,7 @@ export const FooterButtons = ({
   assignmentRefreshTrigger,
   showOnlyActionButtons,
   hideActionButtons,
+  isAssigning,
 }: {
   currentUser: { id: string; name: string; email: string; role: string };
   currentStage: string;
@@ -66,6 +67,7 @@ export const FooterButtons = ({
   assignmentRefreshTrigger?: number;
   showOnlyActionButtons?: boolean;
   hideActionButtons?: boolean;
+  isAssigning?: boolean;
 }) => {
   const [availableUsers, setAvailableUsers] = useState<
     { id: string; name: string; email: string; role: string }[]
@@ -283,9 +285,18 @@ export const FooterButtons = ({
           {!showOnlyActionButtons && currentUser?.role === "projectManager" && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="outline" className="p-5">
-                  <ChevronDown className="h-4 w-4" />
-                  Select Member to Assign
+                <Button variant="outline" className="p-5" disabled={isAssigning}>
+                  {isAssigning ? (
+                    <div className="flex items-center gap-2">
+                      <CircleDashed className="h-4 w-4 animate-spin" />
+                      Assigning...
+                    </div>
+                  ) : (
+                    <>
+                      <ChevronDown className="h-4 w-4" />
+                      Select Member to Assign
+                    </>
+                  )}
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent className="w-56 max-h-[300px] overflow-y-auto">
